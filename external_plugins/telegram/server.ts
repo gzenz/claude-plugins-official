@@ -636,7 +636,12 @@ let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('telegram channel: shutting down\n')
+  // Destroy stdin immediately to stop MCP transport's flowing-mode listener.
+  // Bun busy-polls broken unix sockets in flowing mode, causing 100% CPU spin.
+  try { process.stdin.destroy() } catch {}
+  // stderr may already be broken (peer closed) — wrap so we don't abort before
+  // reaching process.exit().
+  try { process.stderr.write('telegram channel: shutting down\n') } catch {}
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
