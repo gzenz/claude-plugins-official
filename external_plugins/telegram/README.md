@@ -58,6 +58,8 @@ With Claude Code running from the previous step, DM your bot on Telegram — it 
 
 Your next DM reaches the assistant.
 
+> Only one session at a time can own the bot. Other sessions (including a second `--channels` session) start but run idle — check `/tmp/telegram-mcp.log` for `session not subscribed` or `another subscribed session owns pid=...` if a session isn't receiving messages.
+
 > Unlike Discord, there's no server invite step — Telegram bots accept DMs immediately. Pairing handles the user-ID lookup so you never touch numeric IDs.
 
 **6. Lock it down.**

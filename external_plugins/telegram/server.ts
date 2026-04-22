@@ -53,20 +53,62 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
+// Every CC session spawns this server (plugin is globally installed), but only
+// the session launched with `--channels plugin:telegram@...` actually routes
+// messages through us. Non-subscribed sessions used to race for the PID file
+// and SIGTERM each other's pollers, killing the subscribed session's bot.
+// Walk the parent chain: if we can identify a `claude` ancestor without
+// --channels for this plugin, run inert. Any ambiguity → act as subscribed,
+// matching pre-fix behavior.
+function isSubscribedSession(): boolean {
+  if (process.platform === 'win32') return true
+  let pid = process.ppid
+  for (let i = 0; i < 6 && pid > 1; i++) {
+    try {
+      const r = Bun.spawnSync(['ps', '-o', 'ppid=,args=', '-p', String(pid)])
+      const line = new TextDecoder().decode(r.stdout).trim()
+      if (!line) break
+      const m = line.match(/^\s*(\d+)\s+(.*)$/)
+      if (!m) break
+      const [, ppidStr, args] = m
+      if (args.includes('--channels') && args.includes('plugin:telegram')) return true
+      if (/(^|\/)claude(\s|$)/.test(args)) return false
+      pid = parseInt(ppidStr, 10)
+    } catch { return true }
+  }
+  return true
+}
+let SUBSCRIBED = isSubscribedSession()
+
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// 409 Conflict. Replace only *dead* holders; if an alive subscribed
+// incumbent already owns the token, demote ourselves to inert instead of
+// SIGTERMing them (two --channels sessions would otherwise fight).
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+if (SUBSCRIBED) {
+  let incumbentAlive = false
+  let incumbent = 0
+  try {
+    incumbent = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (incumbent > 1 && incumbent !== process.pid) {
+      process.kill(incumbent, 0)  // throws if dead
+      incumbentAlive = true
+    }
+  } catch {}
+  if (incumbentAlive) {
+    SUBSCRIBED = false
+    process.stderr.write(`telegram channel: another subscribed session owns pid=${incumbent}, running inert\n`)
+  } else {
+    if (incumbent > 1 && incumbent !== process.pid) {
+      process.stderr.write(`telegram channel: replacing dead poller pid=${incumbent}\n`)
+    }
+    writeFileSync(PID_FILE, String(process.pid))
   }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+} else {
+  process.stderr.write('telegram channel: session not subscribed (no --channels plugin:telegram), running inert\n')
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -336,7 +378,7 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+if (SUBSCRIBED && !STATIC) setInterval(checkApprovals, 5000).unref()
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -504,6 +546,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (!SUBSCRIBED) {
+    return {
+      content: [{ type: 'text', text: `telegram channel not enabled for this session (launch claude with --channels plugin:telegram@claude-plugins-official)` }],
+      isError: true,
+    }
+  }
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
@@ -642,13 +690,17 @@ function shutdown(): void {
   // stderr may already be broken (peer closed) — wrap so we don't abort before
   // reaching process.exit().
   try { process.stderr.write('telegram channel: shutting down\n') } catch {}
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
-  // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  if (SUBSCRIBED) {
+    try {
+      if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+    } catch {}
+    // bot.stop() signals the poll loop to end; the current getUpdates request
+    // may take up to its long-poll timeout to return. Force-exit after 2s.
+    setTimeout(() => process.exit(0), 2000)
+    void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  } else {
+    setTimeout(() => process.exit(0), 100)
+  }
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -1018,6 +1070,7 @@ bot.catch(err => {
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
 void (async () => {
+  if (!SUBSCRIBED) return
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
